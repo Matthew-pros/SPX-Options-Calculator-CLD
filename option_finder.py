@@ -130,4 +130,208 @@ class OptionFinder:
             end = current * 1.05   # 5% ITM
             step = 1 if current < 100 else 5 if current < 1000 else 10
         
-        #
+        # Generovat strikes
+        current_strike = start
+        while (current_strike <= end if is_call else current_strike >= end):
+            # Zaokrouhlit na nejbližší standardní strike
+            rounded = self._round_to_standard_strike(current_strike)
+            if rounded not in strikes:
+                strikes.append(rounded)
+            current_strike += step if is_call else -step
+        
+        return sorted(strikes)
+    
+    def _round_to_standard_strike(self, price: float) -> float:
+        """
+        Zaokrouhlí na standardní strike price
+        """
+        if price < 10:
+            return round(price * 2) / 2  # 0.5 increments
+        elif price < 100:
+            return round(price)  # 1.0 increments
+        elif price < 500:
+            return round(price / 5) * 5  # 5.0 increments
+        else:
+            return round(price / 10) * 10  # 10.0 increments
+    
+    def find_spread_strategy(self, instrument: str, current_price: float,
+                            entry: float, target: float, risk_amount: float,
+                            is_call: bool = True, dte: int = 0, 
+                            iv: float = 0.20) -> Dict:
+        """
+        Najde optimální vertical spread
+        """
+        # Šířka spreadu
+        spread_width = abs(target - entry) / 2
+        
+        if is_call:
+            long_strike = self._round_to_standard_strike(entry - spread_width/4)
+            short_strike = self._round_to_standard_strike(target)
+        else:
+            long_strike = self._round_to_standard_strike(entry + spread_width/4)
+            short_strike = self._round_to_standard_strike(target)
+        
+        T = max(dte / 365, 1/365/24)
+        
+        # Ceny opcí
+        long_premium = self.calculator.black_scholes(
+            S=entry, K=long_strike, T=T,
+            r=self.calculator.risk_free_rate,
+            sigma=iv, option_type='call' if is_call else 'put'
+        )
+        
+        short_premium = self.calculator.black_scholes(
+            S=entry, K=short_strike, T=T,
+            r=self.calculator.risk_free_rate,
+            sigma=iv, option_type='call' if is_call else 'put'
+        )
+        
+        # Net debit
+        net_debit = long_premium - short_premium
+        
+        if net_debit <= 0:
+            return {'found': False, 'error': 'Invalid spread pricing'}
+        
+        # Počet spreadů
+        contracts = min(
+            int(risk_amount / (net_debit * 100)),
+            self.max_contracts
+        )
+        
+        if contracts == 0:
+            return {'found': False, 'error': 'Insufficient capital'}
+        
+        # Max profit a loss
+        max_profit = (abs(short_strike - long_strike) - net_debit) * contracts * 100
+        max_loss = net_debit * contracts * 100
+        
+        return {
+            'found': True,
+            'type': 'Vertical Spread',
+            'long_strike': long_strike,
+            'short_strike': short_strike,
+            'net_debit': round(net_debit, 2),
+            'contracts': contracts,
+            'max_profit': round(max_profit, 0),
+            'max_loss': round(max_loss, 0),
+            'rrr': round(max_profit / max_loss, 1) if max_loss > 0 else 0,
+            'breakeven': long_strike + net_debit if is_call else long_strike - net_debit
+        }
+    
+    def find_butterfly_strategy(self, instrument: str, current_price: float,
+                               pin_target: float, risk_amount: float,
+                               is_call: bool = True, dte: int = 0,
+                               iv: float = 0.20) -> Dict:
+        """
+        Najde optimální butterfly spread pro "pin" strategie
+        """
+        # ATM strike (střed butterfly)
+        atm_strike = self._round_to_standard_strike(pin_target)
+        
+        # Křídla (symetrická)
+        wing_width = current_price * 0.02  # 2% šířka křídel
+        lower_strike = self._round_to_standard_strike(atm_strike - wing_width)
+        upper_strike = self._round_to_standard_strike(atm_strike + wing_width)
+        
+        T = max(dte / 365, 1/365/24)
+        
+        # Vypočítat prémie
+        lower_premium = self.calculator.black_scholes(
+            S=current_price, K=lower_strike, T=T,
+            r=self.calculator.risk_free_rate,
+            sigma=iv, option_type='call' if is_call else 'put'
+        )
+        
+        atm_premium = self.calculator.black_scholes(
+            S=current_price, K=atm_strike, T=T,
+            r=self.calculator.risk_free_rate,
+            sigma=iv, option_type='call' if is_call else 'put'
+        )
+        
+        upper_premium = self.calculator.black_scholes(
+            S=current_price, K=upper_strike, T=T,
+            r=self.calculator.risk_free_rate,
+            sigma=iv, option_type='call' if is_call else 'put'
+        )
+        
+        # Net debit (long 1 lower, short 2 ATM, long 1 upper)
+        net_debit = lower_premium - 2 * atm_premium + upper_premium
+        
+        if net_debit <= 0:
+            return {'found': False, 'error': 'Butterfly yields credit (check inputs)'}
+        
+        # Počet butterfly spreadů
+        contracts = min(
+            int(risk_amount / (net_debit * 100)),
+            self.max_contracts
+        )
+        
+        if contracts == 0:
+            return {'found': False, 'error': 'Insufficient capital for butterfly'}
+        
+        # Max profit (při pin na ATM strike)
+        max_profit = (atm_strike - lower_strike - net_debit) * contracts * 100
+        max_loss = net_debit * contracts * 100
+        
+        return {
+            'found': True,
+            'type': 'Butterfly Spread',
+            'lower_strike': lower_strike,
+            'atm_strike': atm_strike,
+            'upper_strike': upper_strike,
+            'net_debit': round(net_debit, 2),
+            'contracts': contracts,
+            'max_profit': round(max_profit, 0),
+            'max_loss': round(max_loss, 0),
+            'rrr': round(max_profit / max_loss, 1) if max_loss > 0 else 0,
+            'pin_target': atm_strike,
+            'profit_range': f"${lower_strike + net_debit:.2f} - ${upper_strike - net_debit:.2f}"
+        }
+    
+    def analyze_multiple_strategies(self, **kwargs) -> pd.DataFrame:
+        """
+        Porovná více strategií najednou
+        """
+        strategies = []
+        
+        # Single option
+        single = self.find_best_strike(**kwargs)
+        if single['found']:
+            strategies.append({
+                'Strategy': 'Single Option',
+                'Max Profit': single['max_profit'],
+                'Max Loss': single['total_risk'],
+                'RRR': single['rrr'],
+                'Probability': f"{single['probability']:.1%}",
+                'Contracts': single['contracts']
+            })
+        
+        # Vertical spread
+        spread = self.find_spread_strategy(**kwargs)
+        if spread['found']:
+            strategies.append({
+                'Strategy': 'Vertical Spread',
+                'Max Profit': spread['max_profit'],
+                'Max Loss': spread['max_loss'],
+                'RRR': spread['rrr'],
+                'Probability': 'N/A',
+                'Contracts': spread['contracts']
+            })
+        
+        # Butterfly (jen pokud máme pin target)
+        if 'pin_target' in kwargs:
+            butterfly = self.find_butterfly_strategy(
+                pin_target=kwargs['pin_target'],
+                **{k: v for k, v in kwargs.items() if k != 'pin_target'}
+            )
+            if butterfly['found']:
+                strategies.append({
+                    'Strategy': 'Butterfly',
+                    'Max Profit': butterfly['max_profit'],
+                    'Max Loss': butterfly['max_loss'],
+                    'RRR': butterfly['rrr'],
+                    'Probability': 'Pin-based',
+                    'Contracts': butterfly['contracts']
+                })
+        
+        return pd.DataFrame(strategies)
